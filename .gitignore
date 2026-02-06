@@ -1,5 +1,6 @@
 # Chaves e segredos - NUNCA subir para o GitHub
 .env
+botsintese_config.yaml
 *.key
 *secret*
 
