@@ -21,3 +21,6 @@ dados_clientes/
 
 # Logs
 *.log
+
+# Pasta de testes (PDFs grandes e resultados locais)
+testes/

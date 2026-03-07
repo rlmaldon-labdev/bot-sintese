@@ -61,7 +61,7 @@ class Config:
     
     # Processamento - chunks maiores para aproveitar contexto do Gemini
     chunk_size_local: int = 6000   # ~24k chars para Llama 8B
-    chunk_size_cloud: int = 50000  # ~200k chars para Gemini (tem 1M contexto)
+    chunk_size_cloud: int = 200000  # ~800k chars para Gemini (tem 1M contexto)
     chars_per_token: float = 4.0
 
 
@@ -154,7 +154,7 @@ class DadosProcesso:
 
 def detectar_sistema(texto: str) -> str:
     """Detecta qual sistema processual gerou o PDF"""
-    texto_lower = texto[:5000].lower()
+    texto_lower = texto[:10000].lower()
     
     if "pje - processo judicial eletrônico" in texto_lower or "pje.tjmg" in texto_lower:
         return "pje"
@@ -162,8 +162,10 @@ def detectar_sistema(texto: str) -> str:
         return "eproc"
     elif "projudi" in texto_lower:
         return "projudi"
-    elif "saj" in texto_lower or "esaj" in texto_lower:
+    elif any(t in texto_lower for t in ["saj", "esaj", "e-saj", "saj/pg5", "sajpg", "portal de serviços e-saj"]):
         return "saj"
+    elif any(t in texto_lower for t in ["foro de", "foro central", "foro regional", "tribunal de justiça do estado de são paulo", "tjsp"]):
+        return "saj"  # TJSP usa SAJ
     else:
         return "generico"
 
@@ -255,11 +257,87 @@ def extrair_dados_eproc(texto: str) -> DadosProcesso:
         ))
     
     return dados
+    return dados
 
+
+def extrair_dados_saj(texto: str) -> DadosProcesso:
+    """Extrai dados de PDF do sistema SAJ (TJSP/TJAK/etc)"""
+    dados = DadosProcesso(sistema="saj")
+    texto_inicio = texto[:5000]  # Cabeçalho costuma estar no início
+    
+    # Número do processo
+    match = re.search(r'Processo\s*n[º°]:?\s*([\d.-]+)', texto_inicio, re.IGNORECASE)
+    if match:
+        dados.numero = match.group(1).strip()
+    
+    # Classe - Assunto (Padrão SAJ: "Classe - Assunto: Execução... - Nota Promissória")
+    # Tenta pegar a linha completa primeiro
+    match = re.search(r'Classe\s*-\s*Assunto:?\s*([^\n]+)', texto_inicio, re.IGNORECASE)
+    if match:
+        conteudo = match.group(1).strip()
+        if " - " in conteudo:
+            partes_classe = conteudo.split(" - ", 1)
+            dados.classe = partes_classe[0].strip()
+            dados.assunto = partes_classe[1].strip()
+        else:
+            dados.classe = conteudo
+    else:
+        # Fallback para "Classe:" isolado
+        match = re.search(r'Classe:?\s*([^\n]+)', texto_inicio, re.IGNORECASE)
+        if match:
+            dados.classe = match.group(1).strip()
+            
+    # Foro / Comarca
+    match = re.search(r'Foro\s*(?:de|da|do)?\s*([^\n]+)', texto_inicio, re.IGNORECASE)
+    if not match:
+        match = re.search(r'Comarca\s*(?:de|da|do)?\s*([^\n]+)', texto_inicio, re.IGNORECASE)
+    if match:
+        dados.comarca = match.group(1).strip()
+        
+    # Vara
+    match = re.search(r'(\d+ª\s*Vara\s*[^\n]+)', texto_inicio, re.IGNORECASE)
+    if match:
+        dados.vara = match.group(1).strip()
+        
+    # Data de distribuição (muitas vezes aparece como "Distribuição:")
+    match = re.search(r'Distribuição:?\s*(\d{2}/\d{2}/\d{4})', texto_inicio, re.IGNORECASE)
+    if match:
+        dados.data_distribuicao = match.group(1)
+        
+    # Juiz
+    match = re.search(r'Juiz\(a\)\s*de\s*Direito:?\s*Dr\(a\)\.\s*([^\n]+)', texto_inicio, re.IGNORECASE)
+    # Não temos campo Juiz no DadosProcesso, mas ajuda a confirmar que é cabeçalho
+    
+    # Partes (Exequente / Executado / Requerente / Requerido)
+    # Padrão SAJ: "Exequente: Nome..."
+    #             "Executado: Nome..."
+    polos_map = {
+        'Exequente': 'Autor', 'Requerente': 'Autor', 'Autor': 'Autor', 'Embargante': 'Autor',
+        'Executado': 'Réu', 'Requerido': 'Réu', 'Réu': 'Réu', 'Embargado': 'Réu'
+    }
+    
+    for label, polo_norm in polos_map.items():
+        pattern = rf'{label}:?\s*([^\n]+)'
+        for match in re.finditer(pattern, texto_inicio, re.IGNORECASE):
+            nome = match.group(1).strip()
+            # Evita pegar texto processual que venha depois (ex: "Exequente: Nome do cara. Vistos...")
+            if "." in nome:
+                nome = nome.split(".")[0]
+            
+            if len(nome) > 3 and "juiz" not in nome.lower():
+                dados.partes.append({
+                    'nome': nome.strip(),
+                    'polo': polo_norm
+                })
+
+    return dados
 
 def extrair_dados_generico(texto: str) -> DadosProcesso:
     """Extrai dados de PDF sem sistema identificado"""
     dados = DadosProcesso(sistema="generico")
+    
+    # Usa primeiros 10000 chars para dados estruturados
+    texto_inicio = texto[:10000]
     
     # Tenta encontrar número de processo em vários formatos
     patterns_processo = [
@@ -269,9 +347,70 @@ def extrair_dados_generico(texto: str) -> DadosProcesso:
     ]
     
     for pattern in patterns_processo:
-        match = re.search(pattern, texto[:2000])
+        match = re.search(pattern, texto_inicio)
         if match:
             dados.numero = match.group(1).strip()
+            break
+    
+    # Classe processual
+    patterns_classe = [
+        r'[Cc]lasse[:\s]+([A-Z][^\n]{3,60})',  # Exige Maiúscula inicial e max 60 chars
+        r'[Aa]ção\s+de\s+([A-Z][^\n]{3,60})',
+        r'[Tt]ipo\s+de\s+[Aa]ção[:\s]+([^\n]{3,60})',
+    ]
+    for pattern in patterns_classe:
+        match = re.search(pattern, texto_inicio)
+        if match:
+            # Limpeza extra
+            valor = match.group(1).strip().rstrip('.')
+            if len(valor) > 3 and "..." not in valor and not valor.isdigit():
+                 dados.classe = valor
+                 break
+    
+    # Vara e Foro
+    patterns_vara = [
+        r'(\d+[ªa]?\s*[Vv]ara\s+[^\n]{3,60})',
+        r'[Vv]ara[:\s]+([^\n]{5,60})',
+        r'([Jj]uizado\s+[Ee]special\s+[^\n]{3,60})',
+    ]
+    for pattern in patterns_vara:
+        match = re.search(pattern, texto_inicio)
+        if match:
+            dados.vara = match.group(1).strip().rstrip('.')
+            break
+    
+    # Comarca
+    patterns_comarca = [
+        r'[Cc]omarca\s+(?:de\s+)?([A-Z][^\n]{3,40})',  # Maiúscula e curto
+        r'[Ff]oro\s+(?:(?:da|de|do)\s+)?(?:[Cc]omarca\s+(?:de\s+)?)?([A-Z][^\n]{3,40})',
+    ]
+    for pattern in patterns_comarca:
+        match = re.search(pattern, texto_inicio)
+        if match:
+            dados.comarca = match.group(1).strip().rstrip('.')
+            break
+    
+    # Data de distribuição
+    patterns_dist = [
+        r'[Dd]istribui[çc][ãa]o[:\s]*(\d{2}/\d{2}/\d{4})',
+        r'[Dd]istribuíd[oa]\s+em[:\s]*(\d{2}/\d{2}/\d{4})',
+        r'[Dd]ata\s+de\s+[Dd]istribui[çc][ãa]o[:\s]*(\d{2}/\d{2}/\d{4})',
+    ]
+    for pattern in patterns_dist:
+        match = re.search(pattern, texto_inicio)
+        if match:
+            dados.data_distribuicao = match.group(1)
+            break
+    
+    # Assunto
+    patterns_assunto = [
+        r'[Aa]ssunto[:\s]+([A-Z][^\n]{3,80})',
+        r'[Aa]ssunto\s+[Pp]rincipal[:\s]+([A-Z][^\n]{3,80})',
+    ]
+    for pattern in patterns_assunto:
+        match = re.search(pattern, texto_inicio)
+        if match:
+            dados.assunto = match.group(1).strip().rstrip('.')
             break
     
     # Valor da causa
@@ -358,6 +497,11 @@ Extraia as seguintes informações em formato JSON (retorne APENAS o JSON, sem t
     "partes": [
         {{"nome": "Nome completo da parte", "polo": "Autor/Réu"}}
     ],
+    "classe_processual": "Tipo da ação (ex: Execução de Título Extrajudicial, Ação de Cobrança, etc.)",
+    "vara": "Vara e Foro onde tramita o processo",
+    "comarca": "Comarca do processo",
+    "data_distribuicao": "dd/mm/aaaa",
+    "assunto": "Assunto principal do processo",
     "objeto_acao": "Descrição breve do que se trata a ação (1-2 frases)",
     "resumo_fatos": "Narrativa dos fatos em parágrafos bem formatados, com quebras de linha (\\n\\n) entre parágrafos. Conte a história do processo de forma clara e cronológica.",
     "valores_relevantes": [
@@ -375,7 +519,7 @@ Extraia as seguintes informações em formato JSON (retorne APENAS o JSON, sem t
     "historico_detalhado": [
         {{"data": "dd/mm/aaaa", "evento": "Tipo do evento", "descricao": "O que aconteceu de fato, quem fez, qual o conteúdo resumido"}}
     ],
-    "status_atual": "Fase processual atual"
+    "status_atual": "Descreva o status atual baseado no ÚLTIMO despacho/decisão encontrado no texto. Inclua a data e o conteúdo resumido do último ato judicial."
 }}
 
 REGRAS IMPORTANTES:
@@ -389,7 +533,14 @@ REGRAS IMPORTANTES:
 - No resumo_fatos, use parágrafos separados por \\n\\n para facilitar leitura
 - Em valores_relevantes, inclua APENAS valores diretamente relacionados à causa (valor da causa, valores cobrados, danos pedidos). NÃO inclua capital social de empresas, valor de cotas, salários, etc.
 - Em documentos_importantes, foque nas peças processuais principais: petição inicial, contestações, réplicas, decisões, sentenças, laudos
-- Em historico_detalhado, seja específico: não "Manifestação", mas "Manifestação do autor sobre citação"
+- Em historico_detalhado:
+  * Inclua TODOS os eventos relevantes encontrados, cobrindo desde o ajuizamento até o ato mais recente
+  * Inclua especificamente: despachos, decisões, citações, intimações, penhoras, avaliações, leilões, expedição de mandados
+  * Inclua TODOS os despachos e decisões, mesmo os mais simples como "Cite-se" ou "Dê-se vista"
+  * O último evento deve ser o ato mais recente encontrado no texto
+  * Seja específico: não "Manifestação", mas "Manifestação do autor sobre citação"
+  * PRIORIZE completude — é melhor incluir um evento a mais do que perder um despacho importante
+- Em status_atual, baseie-se SEMPRE no último despacho/decisão do processo, não em suposições sobre a fase genérica
 - Seja conciso e objetivo"""
 
 
@@ -491,19 +642,32 @@ def is_evento_relevante(descricao: str) -> bool:
     
     desc_lower = descricao.lower()
     
+    # Termos que SEMPRE indicam relevância (allowlist - tem prioridade)
+    termos_sempre_relevantes = [
+        'despacho', 'decisão', 'sentença', 'acórdão',
+        'citação', 'citado', 'cite-se', 'intimação', 'intimado',
+        'penhora', 'penhorado', 'avaliação', 'leilão', 'hasta',
+        'mandado', 'carta precatória', 'carta rogatória',
+        'contestação', 'réplica', 'impugnação', 'embargos',
+        'perícia', 'laudo', 'perito', 'audiência',
+        'acordo', 'homologação', 'cumprimento',
+        'recurso', 'apelação', 'agravo', 'tutela',
+        'bloqueio', 'sisbajud', 'renajud', 'infojud',
+        'dê-se vista', 'manifestação',
+    ]
+    
+    for termo in termos_sempre_relevantes:
+        if termo in desc_lower:
+            return True
+    
     # Lista de termos que indicam eventos IRRELEVANTES (ruído)
     termos_irrelevantes = [
         'assinado eletronicamente',
         'assinatura eletrônica',
         'documento assinado',
         'concluso para assinatura',
-        'conclusos para',
-        'remetido para',
         'juntada automática',
         'certidão de publicação',
-        'vista ao',
-        'autos recebidos',
-        'aguardando',
         'expediente forense',
         'não houve expediente',
         'feriado',
@@ -689,7 +853,7 @@ def mesclar_extracoes(extracoes: List[Dict]) -> Dict:
                 if not is_evento_relevante(desc):
                     continue
                 
-                chave = f"{data}|{desc[:30]}".lower()
+                chave = f"{data}|{desc[:80]}".lower()
                 if chave not in historico_vistos:
                     historico_vistos.add(chave)
                     
@@ -802,7 +966,7 @@ def chamar_google(prompt: str, config: Config, retry_count: int = 0) -> str:
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.2,
-                    "maxOutputTokens": 8000,
+                    "maxOutputTokens": 65536,
                     "responseMimeType": "application/json"  # Força JSON válido
                 }
             },
@@ -1056,6 +1220,8 @@ def processar_processo(pasta: Path, modo: str, config: Config, callback=None) ->
         dados = extrair_dados_pje(texto_completo)
     elif sistema == "eproc":
         dados = extrair_dados_eproc(texto_completo)
+    elif sistema == "saj":
+        dados = extrair_dados_saj(texto_completo)
     else:
         dados = extrair_dados_generico(texto_completo)
     
@@ -1087,7 +1253,7 @@ def processar_processo(pasta: Path, modo: str, config: Config, callback=None) ->
     for i, chunk in enumerate(chunks):
         log(f"  Parte {i+1}/{len(chunks)}...")
         
-        prompt = PROMPT_EXTRACAO.format(texto=chunk[:15000])
+        prompt = PROMPT_EXTRACAO.format(texto=chunk)
         resposta = chamar_llm(prompt, modo, config)
         
         if resposta:
@@ -1179,19 +1345,26 @@ def gerar_markdown(resultado: Dict, pasta: Path) -> str:
     md.append("---")
     md.append("")
     
-    # Dados Gerais
+    # Dados Gerais (regex + fallback para extração do LLM)
     md.append("## Dados Gerais")
     md.append("")
-    if dados.classe:
-        md.append(f"- **Classe:** {dados.classe}")
-    if dados.vara:
-        md.append(f"- **Vara:** {dados.vara}")
+    classe = dados.classe or extracao.get('classe_processual', '')
+    if classe:
+        md.append(f"- **Classe:** {classe}")
+    vara = dados.vara or extracao.get('vara', '')
+    if vara:
+        md.append(f"- **Vara:** {vara}")
+    comarca = dados.comarca or extracao.get('comarca', '')
+    if comarca:
+        md.append(f"- **Comarca:** {comarca}")
     if dados.valor_causa:
         md.append(f"- **Valor da causa:** {dados.valor_causa}")
-    if dados.data_distribuicao:
-        md.append(f"- **Distribuição:** {dados.data_distribuicao}")
-    if dados.assunto:
-        md.append(f"- **Assunto:** {dados.assunto}")
+    distribuicao = dados.data_distribuicao or extracao.get('data_distribuicao', '')
+    if distribuicao:
+        md.append(f"- **Distribuição:** {distribuicao}")
+    assunto = dados.assunto or extracao.get('assunto', '')
+    if assunto:
+        md.append(f"- **Assunto:** {assunto}")
     md.append("")
     
     # Partes
