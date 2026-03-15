@@ -24,6 +24,7 @@ from typing import Optional, List, Dict, Tuple
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
+import builtins
 
 # Dependências externas
 try:
@@ -42,6 +43,25 @@ except ImportError as e:
 # ============================================================================
 # CONFIGURAÇÕES
 # ============================================================================
+
+def print_seguro(*args, **kwargs):
+    """Faz print sem quebrar quando o terminal nao suporta Unicode."""
+    try:
+        builtins.print(*args, **kwargs)
+    except UnicodeEncodeError:
+        sep = kwargs.get("sep", " ")
+        end = kwargs.get("end", "\n")
+        arquivo = kwargs.get("file", sys.stdout)
+        flush = kwargs.get("flush", False)
+        encoding = getattr(arquivo, "encoding", None) or "utf-8"
+        texto = sep.join(str(arg) for arg in args) + end
+        arquivo.write(texto.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+        if flush:
+            arquivo.flush()
+
+
+print = print_seguro
+
 
 @dataclass
 class Config:
@@ -593,6 +613,112 @@ REGRAS:
 # FUNÇÕES DE NORMALIZAÇÃO E LIMPEZA (v3.0)
 # ============================================================================
 
+INVALID_ESCAPE_RE = re.compile(r'(?<!\\)\\(?!["\\/bfnrtu])')
+INVALID_UNICODE_ESCAPE_RE = re.compile(r'(?<!\\)\\u(?![0-9a-fA-F]{4})')
+CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+
+def extrair_json_candidato(resposta: str) -> str:
+    """Isola o JSON principal de uma resposta do modelo."""
+    if not resposta:
+        return ""
+    
+    texto = resposta.strip().lstrip("\ufeff")
+    texto = re.sub(r'^```(?:json)?\s*', '', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\s*```$', '', texto)
+    
+    inicio = texto.find('{')
+    fim = texto.rfind('}')
+    if inicio >= 0 and fim > inicio:
+        return texto[inicio:fim+1].strip()
+    
+    return texto
+
+
+def gerar_candidatos_json(json_str: str) -> List[str]:
+    """Gera versoes progressivamente mais tolerantes do JSON bruto."""
+    candidatos = []
+    
+    def adicionar(valor: str):
+        valor = (valor or "").strip()
+        if valor and valor not in candidatos:
+            candidatos.append(valor)
+    
+    base = (json_str or "").strip().lstrip("\ufeff")
+    base = (
+        base.replace("\u201c", '"')
+            .replace("\u201d", '"')
+            .replace("\u2018", "'")
+            .replace("\u2019", "'")
+    )
+    adicionar(base)
+    
+    sem_controle = CONTROL_CHAR_RE.sub(' ', base)
+    adicionar(sem_controle)
+    
+    corrigido = re.sub(r',\s*([}\]])', r'\1', sem_controle)
+    corrigido = re.sub(r'}\s*"', '}, "', corrigido)
+    corrigido = re.sub(r']\s*"', '], "', corrigido)
+    adicionar(corrigido)
+    
+    corrigido_escapes = INVALID_UNICODE_ESCAPE_RE.sub(r'\\\\u', corrigido)
+    corrigido_escapes = INVALID_ESCAPE_RE.sub(r'\\\\', corrigido_escapes)
+    adicionar(corrigido_escapes)
+    
+    json_linha_unica = re.sub(r'(?<!\\)\r?\n', ' ', corrigido_escapes)
+    json_linha_unica = re.sub(r'\s{2,}', ' ', json_linha_unica)
+    adicionar(json_linha_unica)
+    
+    return candidatos
+
+
+def parse_json_tolerante(resposta: str) -> Tuple[Optional[Dict], Dict[str, str]]:
+    """Tenta interpretar a resposta como JSON, aplicando correcoes comuns."""
+    debug = {
+        "resposta_bruta": resposta or "",
+        "json_extraido": ""
+    }
+    
+    json_str = extrair_json_candidato(resposta)
+    debug["json_extraido"] = json_str
+    
+    if not json_str:
+        debug["erro_final"] = "Nenhum bloco JSON encontrado na resposta"
+        return None, debug
+    
+    ultimo_erro = ""
+    candidatos = gerar_candidatos_json(json_str)
+    
+    for idx, candidato in enumerate(candidatos, start=1):
+        debug[f"json_candidato_{idx}"] = candidato
+        try:
+            return json.loads(candidato, strict=False), debug
+        except json.JSONDecodeError as e:
+            ultimo_erro = str(e)
+            debug[f"erro_candidato_{idx}"] = ultimo_erro
+    
+    debug["erro_final"] = ultimo_erro or "Falha desconhecida ao interpretar JSON"
+    return None, debug
+
+
+def preparar_pasta_debug(pasta: Path) -> Tuple[Path, Path]:
+    """Cria a pasta de debug desta execucao e retorna (dir, arquivo_log)."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    debug_dir = pasta / "_botsintese_debug" / timestamp
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    return debug_dir, debug_dir / "execucao.log"
+
+
+def salvar_debug_texto(debug_dir: Optional[Path], nome: str, conteudo: str) -> Optional[Path]:
+    """Salva texto de debug em UTF-8."""
+    if not debug_dir:
+        return None
+    
+    caminho = debug_dir / nome
+    caminho.write_text(conteudo or "", encoding='utf-8-sig')
+    return caminho
+
+
 def normalizar_nome(nome: str) -> str:
     """Normaliza nome de parte para evitar duplicatas por acento/caixa"""
     if not nome:
@@ -1125,9 +1251,17 @@ def chamar_llm(prompt: str, modo: str, config: Config) -> str:
 
 def processar_processo(pasta: Path, modo: str, config: Config, callback=None) -> Dict:
     """Processa todos os PDFs de uma pasta"""
+    debug_dir, log_file = preparar_pasta_debug(pasta)
     
     def log(msg):
-        print(msg)
+        try:
+            print(msg)
+        except UnicodeEncodeError:
+            encoding = sys.stdout.encoding or 'utf-8'
+            msg_segura = msg.encode(encoding, errors='replace').decode(encoding, errors='replace')
+            print(msg_segura)
+        with open(log_file, 'a', encoding='utf-8-sig') as f:
+            f.write(msg + "\n")
         if callback:
             callback(msg)
     
@@ -1139,6 +1273,7 @@ def processar_processo(pasta: Path, modo: str, config: Config, callback=None) ->
     }
     
     inicio = time.time()
+    log(f"🗂️ Log detalhado: {log_file}")
     
     # Encontra PDFs (incluindo subpastas)
     pdfs = list(pasta.glob("*.pdf"))
@@ -1255,6 +1390,38 @@ def processar_processo(pasta: Path, modo: str, config: Config, callback=None) ->
         
         prompt = PROMPT_EXTRACAO.format(texto=chunk)
         resposta = chamar_llm(prompt, modo, config)
+        
+        if not resposta:
+            log(f"    ⚠️ Modelo retornou resposta vazia")
+            continue
+        
+        extracao, debug_json = parse_json_tolerante(resposta)
+        if extracao:
+            extracoes.append(extracao)
+            if "erro_candidato_1" in debug_json:
+                log(f"    ✅ Extraído após correção automática")
+            else:
+                log(f"    ✅ Extraído com sucesso")
+            continue
+        
+        erro_inicial = debug_json.get("erro_candidato_1")
+        if erro_inicial:
+            log(f"    ⚠️ Resposta não é JSON válido: {erro_inicial[:80]}")
+        else:
+            log(f"    ⚠️ Nenhum JSON encontrado na resposta")
+            log(f"    📝 Início da resposta: {resposta[:200]}...")
+        
+        base_nome = f"parte_{i+1:02d}"
+        bruto_path = salvar_debug_texto(debug_dir, f"{base_nome}_resposta_bruta.txt", debug_json.get("resposta_bruta", ""))
+        salvar_debug_texto(debug_dir, f"{base_nome}_json_extraido.txt", debug_json.get("json_extraido", ""))
+        for chave, conteudo in debug_json.items():
+            if chave.startswith("json_candidato_"):
+                salvar_debug_texto(debug_dir, f"{base_nome}_{chave}.txt", conteudo)
+        
+        log(f"    ❌ Falha definitiva no parse: {debug_json.get('erro_final', 'erro desconhecido')[:80]}")
+        if bruto_path:
+            log(f"    🧪 Resposta bruta salva em: {bruto_path}")
+        continue
         
         if resposta:
             # Tenta extrair JSON da resposta
